@@ -1,0 +1,175 @@
+import 'package:flutter/material.dart';
+import 'package:xtream_code_client/xtream_code_client.dart';
+import 'VodScreen.dart';
+import 'SeriesScreen.dart';
+import 'LiveStreamScreen.dart';
+import 'package:hive/hive.dart';
+import 'package:jtv/epg_listing.dart';
+
+class PickerScreen extends StatefulWidget {
+  final XtreamCodeClient client;
+
+  PickerScreen({required this.client});
+
+  @override
+  _PickerScreenState createState() => _PickerScreenState();
+}
+
+class _PickerScreenState extends State<PickerScreen> {
+  bool isRefreshing = false;
+  String epgStatus = 'EPG status: Idle';
+  late Box<XTremeCodeChannelEpgListing> epgBox;
+
+  @override
+  void initState() {
+    super.initState();
+    _initializeHive();
+    _checkAndRefreshEPG();
+  }
+
+  @override
+  void dispose() {
+    epgBox.close(); // Close the box when the widget is disposed
+    super.dispose();
+  }
+
+  Future<void> _initializeHive() async {
+    epgBox = await Hive.openBox<XTremeCodeChannelEpgListing>('epg_data');
+  }
+
+  Future<void> _printHiveDatabase() async {
+    // Open the box
+
+    print('Hive Database Contents:');
+
+    // Iterate through all keys and values
+    for (var key in epgBox.keys) {
+      final value = epgBox.get(key);
+
+      // Print the key and value
+      print('Key: $key, Value: $value');
+    }
+  }
+
+  Future<void> _checkAndRefreshEPG({bool forceRefresh = false}) async {
+    setState(() {
+      isRefreshing = true;
+      epgStatus = 'EPG is being refreshed...';
+    });
+
+    try {
+      // Open separate boxes for metadata and EPG data
+      final metadataBox = await Hive.openBox('epg_metadata');
+
+      // Retrieve the last fetch time
+      final lastFetch = metadataBox.get('last_fetch') as String?;
+
+      // Fetch EPG data if forced or if data is outdated
+      if (forceRefresh ||
+          lastFetch == null ||
+          DateTime.now().difference(DateTime.parse(lastFetch)).inHours > 1) {
+        final epgResponse = await widget.client.epg();
+        // Transform and save EPG listings
+        final epgListings = epgResponse.channels
+            .map((channel) => XTremeCodeChannelEpgListing(
+                  id: channel.id, // Keep as String
+                  epgId: 0, // Example default value
+                  title: channel.displayNames.isNotEmpty
+                      ? channel.displayNames.first.value
+                      : 'Unknown Title',
+                  lang: '', // Default if not available
+                  start: DateTime.now(), // Replace with actual start
+                  end: DateTime.now()
+                      .add(Duration(hours: 1)), // Replace with actual end
+                  description:
+                      'No description', // Replace with actual description
+                  channelId: channel.id,
+                  startTimestamp: DateTime.now(),
+                  stopTimestamp: DateTime.now().add(Duration(hours: 1)),
+                  stop: DateTime.now().add(Duration(hours: 1)),
+                ))
+            .toList();
+
+        await epgBox.clear();
+        await epgBox.addAll(epgListings);
+
+        // Update the last fetch timestamp in the metadata box
+        metadataBox.put('last_fetch', DateTime.now().toIso8601String());
+
+        setState(() {
+          epgStatus = 'EPG refreshed successfully!';
+        });
+
+        print('EPG data refreshed and saved locally.');
+      } else {
+        setState(() {
+          epgStatus = 'EPG is already up to date.';
+        });
+
+        print('EPG data is up to date.');
+      }
+    } catch (e) {
+      setState(() {
+        epgStatus = 'Error refreshing EPG: $e';
+      });
+      print('Error refreshing EPG: $e');
+    } finally {
+      setState(() {
+        isRefreshing = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Pick a Category'),
+      ),
+      body: Center(
+        child: isRefreshing
+            ? CircularProgressIndicator()
+            : Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  /*ElevatedButton(
+                    onPressed: () {
+                      Navigator.push(
+                        context,
+                        /*MaterialPageRoute(
+                          builder: (context) =>
+                              LiveStreamScreen(epgBox: epgBox),
+                        ),
+                      );
+                    },*/
+                    child: Text('Live Stream'),
+                  ),*/
+                  SizedBox(height: 20),
+                  ElevatedButton(
+                    onPressed: () {
+                      Navigator.pushNamed(context, '/vod');
+                    },
+                    child: Text('Video on Demand'),
+                  ),
+                  SizedBox(height: 20),
+                  ElevatedButton(
+                    onPressed: () {
+                      Navigator.pushNamed(context, '/series');
+                    },
+                    child: Text('Series'),
+                  ),
+                  ElevatedButton(
+                    onPressed: () async {
+                      await _checkAndRefreshEPG(
+                          forceRefresh:
+                              true); // Force refresh when button is tapped
+                      await _printHiveDatabase();
+                    },
+                    child: Text('Force Refresh EPG'),
+                  ),
+                ],
+              ),
+      ),
+    );
+  }
+}
