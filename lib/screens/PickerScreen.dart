@@ -7,6 +7,8 @@ import 'package:jtv/epg_models.dart';
 import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart'; // Provides [Player], [Media], [Playlist] etc.
 import 'package:media_kit_video/media_kit_video.dart';
+import 'package:jtv/screens/SearchDialog.dart';
+import 'package:jtv/screens/VodScreen.dart';
 
 class PickerScreen extends StatefulWidget {
   final dynamic client;
@@ -33,13 +35,16 @@ class _PickerScreenState extends State<PickerScreen> {
   // ignore: prefer_final_fields
   bool _isScrolling = false;
   bool _isFullScreen = false;
-
+  Timer? _longPressTimer;
+  bool _isLongPress = false;
+  final FocusNode _mainFocusNode = FocusNode();
   late final player = Player();
   late final _videoController = VideoController(player);
   @override
   void initState() {
     super.initState();
     MediaKit.ensureInitialized();
+    Hive.registerAdapter(FavoriteChannelAdapter());
     _initializeData();
     _timelineController.addListener(_synchronizeScroll);
   }
@@ -52,6 +57,7 @@ class _PickerScreenState extends State<PickerScreen> {
     for (var controller in _programControllers) {
       controller.dispose();
     }
+    _mainFocusNode.dispose();
     super.dispose();
   }
 
@@ -69,7 +75,7 @@ class _PickerScreenState extends State<PickerScreen> {
     try {
       await Hive.openBox<EPGChannel>('epg_channels');
       await Hive.openBox<EPGProgram>('epg_programs');
-
+      await Hive.openBox<FavoriteChannel>('favorites');
       if (Hive.box<EPGChannel>('epg_channels').isEmpty) {
         await _refreshEPGData();
       }
@@ -272,57 +278,337 @@ class _PickerScreenState extends State<PickerScreen> {
     }
   }
 
+  Future<bool> _showAddToFavoritesDialog(
+      BuildContext context, EPGChannel? channel) async {
+    if (channel == null) return false;
+
+    final favoritesBox = Hive.box<FavoriteChannel>('favorites');
+    final isAlreadyFavorite =
+        favoritesBox.values.any((fav) => fav.id == channel.id);
+
+    if (isAlreadyFavorite) return false;
+
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext context) => AlertDialog(
+        backgroundColor: Colors.grey.shade900,
+        title: Text(
+          'Add to Favorites',
+          style: TextStyle(color: Colors.white),
+        ),
+        content: Text(
+          'Would you like to add "${channel.name}" to your favorites?',
+          style: TextStyle(color: Colors.white70),
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: Text('No', style: TextStyle(color: Colors.grey)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: Text('Yes', style: TextStyle(color: Colors.blue)),
+          ),
+        ],
+      ),
+    );
+
+    return result ?? false;
+  }
+
+  Future<void> _addToFavorites(EPGChannel? channel) async {
+    if (channel?.streamId == null) return;
+
+    final favoritesBox = await Hive.openBox<FavoriteChannel>('favorites');
+
+    final favorite = FavoriteChannel(
+      id: channel!.id,
+      name: channel.name,
+      iconUrl: channel.iconUrl,
+      streamId: channel.streamId!,
+    );
+
+    await favoritesBox.add(favorite);
+
+    // Show confirmation
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('${channel.name} added to favorites'),
+          backgroundColor: Colors.green,
+          duration: Duration(seconds: 2),
+        ),
+      );
+    }
+  }
+
+  void _handleLongPress() {
+    _isLongPress = true;
+    final channelsBox = Hive.box<EPGChannel>('epg_channels');
+    final channel = channelsBox.getAt(selectedChannelIndex);
+    _showAddToFavoritesDialog(context, channel);
+  }
+
+  void _handleSearch() async {
+    try {
+      final result = await showDialog<SearchResult>(
+        context: context,
+        barrierDismissible: true,
+        barrierColor: Colors.black54,
+        builder: (BuildContext context) => SearchDialog(
+          channelsBox: Hive.box<EPGChannel>('epg_channels'),
+          programsBox: Hive.box<EPGProgram>('epg_programs'),
+        ),
+      );
+
+      if (!mounted) return;
+
+      // Request focus back to main screen
+      _mainFocusNode.requestFocus();
+
+      if (result != null) {
+        final channelsBox = Hive.box<EPGChannel>('epg_channels');
+        final programsBox = Hive.box<EPGProgram>('epg_programs');
+        final channels = channelsBox.values.toList();
+
+        print('Received in PickerScreen:');
+        print('  Type: ${result.type}');
+        print('  Channel ID: ${result.channelId}');
+        print('  Program ID: ${result.programId}');
+        print('  Stream ID: ${result.streamId}');
+        print('  Title: ${result.title}');
+        print('  Subtitle: ${result.subtitle}');
+
+        final channelIndex =
+            channels.indexWhere((c) => c.id == result.channelId);
+        print('Found channel index: $channelIndex');
+
+        if (channelIndex != -1 && mounted) {
+          final channel = channels[channelIndex];
+          print('Channel details:');
+          print('  ID: ${channel.id}');
+          print('  Name: ${channel.name}');
+          print('  Stream ID: ${channel.streamId}');
+          print('  Number of programs: ${channel.programIds.length}');
+
+          // Calculate scroll positions
+          final selectedPosition = channelIndex * rowHeight;
+          final viewportHeight = _verticalController.position.viewportDimension;
+
+          // Scroll to show the channel
+          _verticalController.jumpTo(
+            (selectedPosition - (viewportHeight / 2) + (rowHeight / 2)).clamp(
+              0.0,
+              _verticalController.position.maxScrollExtent,
+            ),
+          );
+
+          // If it's a program, find the specific program and scroll horizontally
+          if (result.type == 'program' && result.programId != null) {
+            final programIndex = channel.programIds.indexOf(result.programId!);
+            if (programIndex != -1) {
+              double horizontalOffset = 0.0;
+
+              for (int i = 0; i < programIndex; i++) {
+                final program = programsBox.get(channel.programIds[i]);
+                if (program != null && program.stop != null) {
+                  final duration = program.stop!.difference(program.start);
+                  horizontalOffset += (duration.inMinutes / 30) * timeSlotWidth;
+                }
+              }
+
+              _timelineController.jumpTo(horizontalOffset.clamp(
+                0.0,
+                _timelineController.position.maxScrollExtent,
+              ));
+
+              // Sync program rows
+              for (var controller in _programControllers) {
+                if (controller.hasClients) {
+                  controller.jumpTo(horizontalOffset.clamp(
+                    0.0,
+                    controller.position.maxScrollExtent,
+                  ));
+                }
+              }
+            }
+          }
+
+          // Add a small delay to ensure the UI has updated before changing selection
+          Future.microtask(() {
+            if (mounted) {
+              setState(() {
+                selectedChannelIndex = channelIndex;
+                if (result.type == 'program' && result.programId != null) {
+                  selectedProgramIndex =
+                      channel.programIds.indexOf(result.programId!);
+                } else {
+                  selectedProgramIndex = 0;
+                }
+              });
+            }
+          });
+        }
+      }
+    } catch (e) {
+      print('Error in search handler: $e');
+    }
+  }
+
+  Future<ViewSection?> _showSectionMenu() {
+    return showDialog<ViewSection>(
+      context: context,
+      builder: (BuildContext context) => _SectionMenuDialog(),
+    );
+  }
+
+  Widget _buildSectionButton(
+    ViewSection section,
+    String label,
+    IconData icon,
+    bool isSelected,
+    VoidCallback onStateChange,
+  ) {
+    return Expanded(
+      child: Container(
+        decoration: BoxDecoration(
+          color: isSelected ? Colors.blue.shade700 : Colors.grey.shade800,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: isSelected ? Colors.blue : Colors.grey.shade700,
+            width: 1,
+          ),
+        ),
+        child: InkWell(
+          onTap: () {
+            Navigator.of(context).pop(section);
+          },
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                icon,
+                color: Colors.white,
+                size: 32,
+              ),
+              const SizedBox(height: 8),
+              Text(
+                label,
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 16,
+                  fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    return KeyboardListener(
-      focusNode: FocusNode(),
-      onKeyEvent: (KeyEvent event) {
-        if (event is KeyDownEvent) {}
-      },
-      child: FocusableActionDetector(
-        autofocus: true,
-        shortcuts: const {
-          SingleActivator(LogicalKeyboardKey.keyR, control: true):
-              RefreshIntent(),
-          SingleActivator(LogicalKeyboardKey.f5): RefreshIntent(),
-          SingleActivator(LogicalKeyboardKey.arrowUp): NavigateIntent('up'),
-          SingleActivator(LogicalKeyboardKey.arrowDown): NavigateIntent('down'),
-          SingleActivator(LogicalKeyboardKey.arrowLeft): NavigateIntent('left'),
-          SingleActivator(LogicalKeyboardKey.arrowRight):
-              NavigateIntent('right'),
-          SingleActivator(LogicalKeyboardKey.enter): ShowInfoIntent(),
+    return GestureDetector(
+      onSecondaryTapUp: (_) => _handleSearch(),
+      child: KeyboardListener(
+        focusNode: FocusNode(),
+        onKeyEvent: (KeyEvent event) {
+          print(
+              "Key pressed: ${event.logicalKey.keyId}, physical: ${event.physicalKey.usbHidUsage}");
+          if (event is KeyDownEvent &&
+              event.logicalKey == LogicalKeyboardKey.enter) {
+            _longPressTimer?.cancel();
+            _longPressTimer = Timer(const Duration(seconds: 1), () {
+              _handleLongPress();
+            });
+          } else if (event is KeyUpEvent &&
+              event.logicalKey == LogicalKeyboardKey.enter) {
+            _longPressTimer?.cancel();
+            if (!_isLongPress) {
+              _showProgramInfo(); // Normal press behavior
+            }
+            _isLongPress = false;
+          }
+          if (event.physicalKey.usbHidUsage == 458853) {
+            _handleSearch();
+          }
+          if (event.physicalKey.usbHidUsage == 786979) {
+            if (event.runtimeType.toString() == "KeyDownEvent") {
+              _showSectionMenu().then((section) {
+                if (section != null) {
+                  // Handle section change
+                  print('Selected section: $section');
+                  switch (section) {
+                    case ViewSection.all:
+                      // Handle all channels view
+                      break;
+                    case ViewSection.favorites:
+                      // Handle favorites view
+                      break;
+                    case ViewSection.vod:
+                      Navigator.of(context).push(
+                        MaterialPageRoute(
+                          builder: (context) =>
+                              VodScreen(client: widget.client),
+                        ),
+                      );
+                      break;
+                    case ViewSection.series:
+                      // Handle series view
+                      break;
+                  }
+                }
+              });
+            }
+          }
         },
-        actions: {
-          RefreshIntent: CallbackAction<RefreshIntent>(
-            onInvoke: (_) {
-              if (!isLoading) {
-                _refreshEPGData();
-              }
-              return null;
-            },
-          ),
-          NavigateIntent: CallbackAction<NavigateIntent>(
-            onInvoke: (intent) => _handleNavigation(intent.direction),
-          ),
-          ShowInfoIntent: CallbackAction<ShowInfoIntent>(
-            onInvoke: (_) => _showProgramInfo(),
-          ),
-        },
-        child: Scaffold(
-          backgroundColor: Colors.black,
-          body: Stack(
-            children: [
-              if (isLoading)
-                const Center(child: CircularProgressIndicator())
-              else
-                Column(
-                  children: [
-                    _buildTimeHeader(),
-                    Expanded(child: _buildProgramGuide()),
-                  ],
-                ),
-              _buildVideoPreview(), // Video preview overlay
-            ],
+        child: FocusableActionDetector(
+          autofocus: true,
+          shortcuts: const {
+            SingleActivator(LogicalKeyboardKey.keyR, control: true):
+                RefreshIntent(),
+            SingleActivator(LogicalKeyboardKey.f5): RefreshIntent(),
+            SingleActivator(LogicalKeyboardKey.arrowUp): NavigateIntent('up'),
+            SingleActivator(LogicalKeyboardKey.arrowDown):
+                NavigateIntent('down'),
+            SingleActivator(LogicalKeyboardKey.arrowLeft):
+                NavigateIntent('left'),
+            SingleActivator(LogicalKeyboardKey.arrowRight):
+                NavigateIntent('right'),
+          },
+          actions: {
+            RefreshIntent: CallbackAction<RefreshIntent>(
+              onInvoke: (_) {
+                if (!isLoading) {
+                  _refreshEPGData();
+                }
+                return null;
+              },
+            ),
+            NavigateIntent: CallbackAction<NavigateIntent>(
+              onInvoke: (intent) => _handleNavigation(intent.direction),
+            ),
+            ShowInfoIntent: CallbackAction<ShowInfoIntent>(
+              onInvoke: (_) => _showProgramInfo(),
+            ),
+          },
+          child: Scaffold(
+            backgroundColor: Colors.black,
+            body: Stack(
+              children: [
+                if (isLoading)
+                  const Center(child: CircularProgressIndicator())
+                else
+                  Column(
+                    children: [
+                      _buildTimeHeader(),
+                      Expanded(child: _buildProgramGuide()),
+                    ],
+                  ),
+                _buildVideoPreview(), // Video preview overlay
+              ],
+            ),
           ),
         ),
       ),
@@ -441,64 +727,143 @@ class _PickerScreenState extends State<PickerScreen> {
   }
 
   Widget _buildTimeHeader() {
-    // Get the current time and round down to the nearest half hour
+    // Get current time slots
     final now = DateTime.now();
     final timelineStart = DateTime(
       now.year,
       now.month,
       now.day,
       now.hour,
-      (now.minute ~/ 30) * 30, // Round to nearest 30 min
+      (now.minute ~/ 30) * 30,
     );
 
     List<DateTime> timeSlots = [];
     var currentTime = timelineStart;
-
-    // Generate time slots
     for (int i = 0; i < 12; i++) {
-      // 6 hours worth of 30-min slots
       timeSlots.add(currentTime);
       currentTime = currentTime.add(const Duration(minutes: 30));
     }
 
-    return SizedBox(
-      height: 50,
-      child: Row(
-        children: [
-          Container(width: channelLogoWidth, color: Colors.black),
-          Expanded(
-            child: ListView.builder(
-              controller: _timelineController,
-              scrollDirection: Axis.horizontal,
-              itemCount: timeSlots.length,
-              itemBuilder: (context, index) {
-                final slotTime = timeSlots[index];
-                final bool isHourMark = slotTime.minute == 0;
+    // Get current channel and program info
+    final channelsBox = Hive.box<EPGChannel>('epg_channels');
+    final programsBox = Hive.box<EPGProgram>('epg_programs');
+    final selectedChannel = channelsBox.getAt(selectedChannelIndex);
+    EPGProgram? selectedProgram;
+    if (selectedChannel?.programIds.isNotEmpty ?? false) {
+      selectedProgram =
+          programsBox.get(selectedChannel!.programIds[selectedProgramIndex]);
+    }
 
-                return Container(
-                  width: timeSlotWidth,
-                  alignment: Alignment.center,
-                  decoration: BoxDecoration(
-                    color: Colors.black,
-                    border: Border(
-                      left: BorderSide(color: Colors.grey.shade800),
-                      bottom: BorderSide(color: Colors.grey.shade800),
+    return Column(
+      children: [
+        // Program info header
+        if (selectedChannel != null && selectedProgram != null)
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(12),
+            color: Colors.grey.shade900,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Text(
+                      selectedChannel.name,
+                      style: const TextStyle(
+                        color: Colors.blue,
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                      ),
                     ),
-                  ),
-                  child: Text(
-                    DateFormat(isHourMark ? 'h:mm a' : 'h:mm').format(slotTime),
+                    const SizedBox(width: 16),
+                    Text(
+                      selectedProgram.title,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                if (selectedProgram.description != null)
+                  Text(
+                    selectedProgram.description!,
                     style: TextStyle(
-                      color: Colors.white,
-                      fontWeight:
-                          isHourMark ? FontWeight.bold : FontWeight.normal,
+                      color: Colors.grey.shade300,
+                      fontSize: 14,
                     ),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
                   ),
-                );
-              },
+                const SizedBox(height: 4),
+                Row(
+                  children: [
+                    Text(
+                      '${DateFormat('h:mm a').format(selectedProgram.start)} - ${DateFormat('h:mm a').format(selectedProgram.stop ?? selectedProgram.start.add(const Duration(minutes: 30)))}',
+                      style: TextStyle(
+                        color: Colors.grey.shade400,
+                        fontSize: 14,
+                      ),
+                    ),
+                    if (selectedProgram.categories.isNotEmpty) ...[
+                      const SizedBox(width: 16),
+                      Text(
+                        selectedProgram.categories.join(', '),
+                        style: TextStyle(
+                          color: Colors.grey.shade400,
+                          fontSize: 14,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ],
             ),
           ),
-        ],
-      ),
+
+        // Time slots header
+        SizedBox(
+          height: 50,
+          child: Row(
+            children: [
+              Container(width: channelLogoWidth, color: Colors.black),
+              Expanded(
+                child: ListView.builder(
+                  controller: _timelineController,
+                  scrollDirection: Axis.horizontal,
+                  itemCount: timeSlots.length,
+                  itemBuilder: (context, index) {
+                    final slotTime = timeSlots[index];
+                    final bool isHourMark = slotTime.minute == 0;
+                    return Container(
+                      width: timeSlotWidth,
+                      alignment: Alignment.center,
+                      decoration: BoxDecoration(
+                        color: Colors.black,
+                        border: Border(
+                          left: BorderSide(color: Colors.grey.shade800),
+                          bottom: BorderSide(color: Colors.grey.shade800),
+                        ),
+                      ),
+                      child: Text(
+                        DateFormat(isHourMark ? 'h:mm a' : 'h:mm')
+                            .format(slotTime),
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontWeight:
+                              isHourMark ? FontWeight.bold : FontWeight.normal,
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
     );
   }
 
@@ -716,4 +1081,172 @@ class NavigateIntent extends Intent {
 
 class ShowInfoIntent extends Intent {
   const ShowInfoIntent();
+}
+
+enum ViewSection { all, favorites, vod, series }
+
+// Create a separate StatefulWidget for the dialog
+class _SectionMenuDialog extends StatefulWidget {
+  @override
+  State<_SectionMenuDialog> createState() => _SectionMenuDialogState();
+}
+
+class _SectionMenuDialogState extends State<_SectionMenuDialog> {
+  int selectedRow = 0;
+  int selectedCol = 0;
+  final focusNode = FocusNode();
+
+  @override
+  void initState() {
+    super.initState();
+    focusNode.requestFocus();
+  }
+
+  @override
+  void dispose() {
+    focusNode.dispose();
+    super.dispose();
+  }
+
+  void _handleKeyEvent(KeyEvent event) {
+    if (event is KeyDownEvent) {
+      setState(() {
+        switch (event.physicalKey.usbHidUsage) {
+          case 458831: // Right
+            if (selectedCol < 1) selectedCol++;
+            break;
+          case 458832: // Left
+            if (selectedCol > 0) selectedCol--;
+            break;
+          case 458833: // Down
+            if (selectedRow < 1) selectedRow++;
+            break;
+          case 458834: // Up
+            if (selectedRow > 0) selectedRow--;
+            break;
+          case 458792: // Enter
+          case 458840: // Keypad Enter
+            final sections = [
+              [ViewSection.all, ViewSection.favorites],
+              [ViewSection.vod, ViewSection.series]
+            ];
+            Navigator.of(context).pop(sections[selectedRow][selectedCol]);
+            break;
+          case 786980: // Escape/Back
+            Navigator.of(context).pop();
+            break;
+        }
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return KeyboardListener(
+      focusNode: focusNode,
+      onKeyEvent: _handleKeyEvent,
+      child: Dialog(
+        backgroundColor: Colors.transparent,
+        child: Container(
+          width: 400,
+          height: 200,
+          decoration: BoxDecoration(
+            color: Colors.grey.shade900,
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Expanded(
+                  child: Row(
+                    children: [
+                      _buildSectionButton(
+                        ViewSection.all,
+                        'All',
+                        Icons.grid_view_rounded,
+                        selectedRow == 0 && selectedCol == 0,
+                      ),
+                      const SizedBox(width: 16),
+                      _buildSectionButton(
+                        ViewSection.favorites,
+                        'Favorites',
+                        Icons.star_rounded,
+                        selectedRow == 0 && selectedCol == 1,
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 16),
+                Expanded(
+                  child: Row(
+                    children: [
+                      _buildSectionButton(
+                        ViewSection.vod,
+                        'VOD',
+                        Icons.video_library_rounded,
+                        selectedRow == 1 && selectedCol == 0,
+                      ),
+                      const SizedBox(width: 16),
+                      _buildSectionButton(
+                        ViewSection.series,
+                        'TV',
+                        Icons.tv_rounded,
+                        selectedRow == 1 && selectedCol == 1,
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSectionButton(
+    ViewSection section,
+    String label,
+    IconData icon,
+    bool isSelected,
+  ) {
+    return Expanded(
+      child: Container(
+        decoration: BoxDecoration(
+          color: isSelected ? Colors.blue.shade700 : Colors.grey.shade800,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: isSelected ? Colors.blue : Colors.grey.shade700,
+            width: 1,
+          ),
+        ),
+        child: InkWell(
+          onTap: () {
+            Navigator.of(context).pop(section);
+          },
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                icon,
+                color: Colors.white,
+                size: 32,
+              ),
+              const SizedBox(height: 8),
+              Text(
+                label,
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 16,
+                  fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }

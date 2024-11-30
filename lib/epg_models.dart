@@ -76,3 +76,25 @@ class EPGProgram extends HiveObject {
         this.episodeNumbers =
             episodeNumbers != null ? List<String>.from(episodeNumbers) : null;
 }
+
+@HiveType(typeId: 2)
+class FavoriteChannel extends HiveObject {
+  @HiveField(0)
+  final String id;
+
+  @HiveField(1)
+  final String name;
+
+  @HiveField(2)
+  final String? iconUrl;
+
+  @HiveField(3)
+  final int streamId;
+
+  FavoriteChannel({
+    required this.id,
+    required this.name,
+    this.iconUrl,
+    required this.streamId,
+  });
+}
