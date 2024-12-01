@@ -12,6 +12,7 @@ void main() async {
   await Hive.initFlutter();
   Hive.registerAdapter(EPGChannelAdapter());
   Hive.registerAdapter(EPGProgramAdapter());
+  Hive.registerAdapter(FavoriteChannelAdapter());
   if (Platform.isLinux) {
     final libc = DynamicLibrary.open('libc.so.6');
     final setlocale = libc.lookupFunction<

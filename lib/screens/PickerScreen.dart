@@ -1,14 +1,17 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:intl/intl.dart';
 import 'package:jtv/epg_models.dart';
 import 'package:flutter/services.dart';
-import 'package:media_kit/media_kit.dart'; // Provides [Player], [Media], [Playlist] etc.
-import 'package:media_kit_video/media_kit_video.dart';
 import 'package:jtv/screens/SearchDialog.dart';
 import 'package:jtv/screens/VodScreen.dart';
+import 'package:jtv/screens/FavoritesScreen.dart';
+import 'package:video_player/video_player.dart';
+import 'package:media_kit/media_kit.dart';
+import 'package:media_kit_video/media_kit_video.dart';
 
 class PickerScreen extends StatefulWidget {
   final dynamic client;
@@ -21,6 +24,8 @@ class PickerScreen extends StatefulWidget {
 }
 
 class _PickerScreenState extends State<PickerScreen> {
+  late final player;
+  late final controller;
   final ScrollController _timelineController = ScrollController();
   final ScrollController _verticalController = ScrollController();
   final List<ScrollController> _programControllers = [];
@@ -38,13 +43,34 @@ class _PickerScreenState extends State<PickerScreen> {
   Timer? _longPressTimer;
   bool _isLongPress = false;
   final FocusNode _mainFocusNode = FocusNode();
-  late final player = Player();
-  late final _videoController = VideoController(player);
+
+  bool _shouldAutoPlay = false;
   @override
   void initState() {
     super.initState();
     MediaKit.ensureInitialized();
-    Hive.registerAdapter(FavoriteChannelAdapter());
+    player = Player(
+      configuration: const PlayerConfiguration(
+        vo: 'gpu', // Use GPU rendering
+        osc: false, // Disable on-screen controls
+        muted: true, // Mute audio
+        logLevel: MPVLogLevel.trace, // Enable detailed logging
+        bufferSize: 64 * 1024 * 1024, // Increase buffer size to 64 MB
+        protocolWhitelist: [
+          'udp',
+          'rtp',
+          'tcp',
+          'tls',
+          'data',
+          'file',
+          'http',
+          'https',
+          'crypto'
+        ], // Allow necessary protocols
+      ),
+    );
+    print(player.stream.log);
+    controller = VideoController(player);
     _initializeData();
     _timelineController.addListener(_synchronizeScroll);
   }
@@ -58,6 +84,9 @@ class _PickerScreenState extends State<PickerScreen> {
       controller.dispose();
     }
     _mainFocusNode.dispose();
+
+    // Stop playback and dispose of player
+    player?.dispose();
     super.dispose();
   }
 
@@ -85,6 +114,7 @@ class _PickerScreenState extends State<PickerScreen> {
   }
 
   Future<void> _refreshEPGData() async {
+    print("Starting EPG Refresh");
     try {
       final epgResponse = await widget.client.epg();
       final liveStreams = await widget.client.livestreamItems();
@@ -103,6 +133,131 @@ class _PickerScreenState extends State<PickerScreen> {
       await channelsBox.clear();
       await programsBox.clear();
 
+      // Get today's date for filtering
+      final now = DateTime.now();
+      final today = DateTime(now.year, now.month, now.day);
+      final tomorrow = today.add(Duration(days: 1));
+
+      // Process channels and programs
+      for (var xmlChannel in epgResponse.channels) {
+        // Get the stream ID if it exists
+        final streamId = streamMapping[xmlChannel.id];
+
+        try {
+          // Filter programs for this channel
+          final channelPrograms = epgResponse.programmes
+              .where((p) => p.channel == xmlChannel.id)
+              .where((p) {
+            final programDate = p.start.toLocal();
+            return programDate.isAfter(today) && programDate.isBefore(tomorrow);
+          }).toList();
+
+          if (channelPrograms.isEmpty) {
+            continue;
+          }
+
+          final programIds = <int>[];
+
+          // Add programs for this channel
+          for (var xmlProgram in channelPrograms) {
+            try {
+              // Convert program times from UTC to local timezone
+              final startLocal = xmlProgram.start.toLocal();
+              final stopLocal = xmlProgram.stop?.toLocal();
+
+              // Only process programs for today
+              if (startLocal.year == today.year &&
+                  startLocal.month == today.month &&
+                  startLocal.day == today.day) {
+                // Safely convert lists to List<String>
+                final categories = xmlProgram.categories
+                    .map((c) => c.value.toString())
+                    .toList()
+                    .cast<String>();
+
+                final episodeNums = xmlProgram.episodeNums
+                    .map((e) => e.value.toString())
+                    .toList()
+                    .cast<String>();
+
+                final program = EPGProgram(
+                  title: xmlProgram.titles.isNotEmpty
+                      ? xmlProgram.titles.first.value.toString()
+                      : 'Unknown',
+                  start: startLocal,
+                  stop: stopLocal,
+                  channelId: xmlChannel.id,
+                  description: xmlProgram.descs.isNotEmpty
+                      ? xmlProgram.descs.first.value.toString()
+                      : null,
+                  categories: categories,
+                  episodeNumbers: episodeNums,
+                  isNew: xmlProgram.isNew,
+                );
+
+                final programId = await programsBox.add(program);
+                programIds.add(programId);
+              }
+            } catch (e) {
+              print('Error processing program: $e');
+              continue;
+            }
+          }
+
+          if (programIds.isNotEmpty) {
+            // Safely convert display names to List<String>
+            final displayNames = xmlChannel.displayNames
+                .map((d) => d.value.toString())
+                .toList()
+                .cast<String>();
+
+            final channel = EPGChannel(
+              id: xmlChannel.id,
+              name:
+                  displayNames.isNotEmpty ? displayNames.first : xmlChannel.id,
+              iconUrl: xmlChannel.icons.isNotEmpty
+                  ? xmlChannel.icons.first.src
+                  : null,
+              displayNames: displayNames,
+              programIds: programIds,
+              streamId: streamId,
+            );
+
+            await channelsBox.add(channel);
+          }
+        } catch (e) {
+          print('Error processing channel: $e');
+          continue;
+        }
+      }
+    } catch (e) {
+      print('Error refreshing EPG: $e');
+      rethrow;
+    }
+    print("Finished EPG Refresh");
+  }
+
+/*
+  Future<void> _refreshEPGData() async {
+    print("Starting EPG Refresh");
+    try {
+      final epgResponse = await widget.client.epg();
+      final liveStreams = await widget.client.livestreamItems();
+
+      // Create mapping of EPG channel IDs to stream IDs
+      final streamMapping = <String, int>{};
+      for (var stream in liveStreams) {
+        if (stream.epgChannelId != null && stream.streamId != null) {
+          streamMapping[stream.epgChannelId!] = stream.streamId!;
+        }
+      }
+
+      final channelsBox = Hive.box<EPGChannel>('epg_channels');
+      final programsBox = Hive.box<EPGProgram>('epg_programs');
+
+      await channelsBox.clear();
+      await programsBox.clear();
+      
       // Process channels and programs
       for (var xmlChannel in epgResponse.channels) {
         // Get the stream ID if it exists
@@ -188,10 +343,11 @@ class _PickerScreenState extends State<PickerScreen> {
     } catch (e) {
       rethrow;
     }
+    print("Finished EPG Refresh");
   }
-
+*/
   Widget _buildVideoPreview() {
-    if (!player.state.playing) {
+    if (player.state.playing == false) {
       return const SizedBox.shrink();
     }
 
@@ -202,8 +358,7 @@ class _PickerScreenState extends State<PickerScreen> {
           child: AspectRatio(
             aspectRatio: 16 / 9,
             child: Video(
-              controller: _videoController,
-              controls: AdaptiveVideoControls, // Use the default controls
+              controller: controller,
             ),
           ),
         ),
@@ -223,10 +378,7 @@ class _PickerScreenState extends State<PickerScreen> {
           child: ClipRRect(
             // Add ClipRRect to prevent overflow
             borderRadius: BorderRadius.circular(6),
-            child: Video(
-              controller: _videoController,
-              controls: AdaptiveVideoControls,
-            ),
+            child: Video(controller: controller),
           ),
         ),
       );
@@ -234,6 +386,10 @@ class _PickerScreenState extends State<PickerScreen> {
   }
 
   void _showProgramInfo() {
+    if (!_shouldAutoPlay) {
+      _shouldAutoPlay = true;
+      return;
+    }
     if (_isFullScreen) {
       // Exit full-screen mode
       setState(() {
@@ -269,7 +425,14 @@ class _PickerScreenState extends State<PickerScreen> {
         }
       }
 
-      player.open(Media(baseUrl));
+      if (baseUrl.isNotEmpty) {
+        try {
+          // No need to dispose of the player, MediaKit handles this
+          player.open(Media(baseUrl));
+        } catch (e) {
+          print('Error initializing video: $e');
+        }
+      }
 
       // Enter full-screen mode
       setState(() {
@@ -286,7 +449,16 @@ class _PickerScreenState extends State<PickerScreen> {
     final isAlreadyFavorite =
         favoritesBox.values.any((fav) => fav.id == channel.id);
 
-    if (isAlreadyFavorite) return false;
+    if (isAlreadyFavorite) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('${channel.name} is already in favorites'),
+          backgroundColor: Colors.orange,
+          duration: Duration(seconds: 2),
+        ),
+      );
+      return false;
+    }
 
     final result = await showDialog<bool>(
       context: context,
@@ -313,16 +485,29 @@ class _PickerScreenState extends State<PickerScreen> {
       ),
     );
 
+    if (result == true) {
+      await _addToFavorites(channel);
+    }
+
     return result ?? false;
   }
 
-  Future<void> _addToFavorites(EPGChannel? channel) async {
-    if (channel?.streamId == null) return;
+  Future<void> _addToFavorites(EPGChannel channel) async {
+    if (channel.streamId == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Cannot add channel without stream ID to favorites'),
+          backgroundColor: Colors.red,
+          duration: Duration(seconds: 2),
+        ),
+      );
+      return;
+    }
 
-    final favoritesBox = await Hive.openBox<FavoriteChannel>('favorites');
+    final favoritesBox = Hive.box<FavoriteChannel>('favorites');
 
     final favorite = FavoriteChannel(
-      id: channel!.id,
+      id: channel.id,
       name: channel.name,
       iconUrl: channel.iconUrl,
       streamId: channel.streamId!,
@@ -330,7 +515,6 @@ class _PickerScreenState extends State<PickerScreen> {
 
     await favoritesBox.add(favorite);
 
-    // Show confirmation
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -346,7 +530,9 @@ class _PickerScreenState extends State<PickerScreen> {
     _isLongPress = true;
     final channelsBox = Hive.box<EPGChannel>('epg_channels');
     final channel = channelsBox.getAt(selectedChannelIndex);
-    _showAddToFavoritesDialog(context, channel);
+    if (channel != null) {
+      _showAddToFavoritesDialog(context, channel);
+    }
   }
 
   void _handleSearch() async {
@@ -544,15 +730,31 @@ class _PickerScreenState extends State<PickerScreen> {
                       // Handle all channels view
                       break;
                     case ViewSection.favorites:
+                      if (player.state.playing) {
+                        player.stop();
+                      }
                       // Handle favorites view
+                      Navigator.pushReplacement(
+                        context,
+                        MaterialPageRoute(
+                          builder: (context) =>
+                              FavoritesScreen(client: widget.client),
+                        ),
+                      );
                       break;
                     case ViewSection.vod:
-                      Navigator.of(context).push(
+                      if (player.state.playing) {
+                        player.stop();
+                      }
+
+                      Navigator.pushReplacement(
+                        context,
                         MaterialPageRoute(
                           builder: (context) =>
                               VodScreen(client: widget.client),
                         ),
                       );
+
                       break;
                     case ViewSection.series:
                       // Handle series view
@@ -744,14 +946,36 @@ class _PickerScreenState extends State<PickerScreen> {
       currentTime = currentTime.add(const Duration(minutes: 30));
     }
 
-    // Get current channel and program info
+    // Get current channel and program info from the visible grid
     final channelsBox = Hive.box<EPGChannel>('epg_channels');
     final programsBox = Hive.box<EPGProgram>('epg_programs');
-    final selectedChannel = channelsBox.getAt(selectedChannelIndex);
+
+    // Get all channels
+    final channels = channelsBox.values.toList();
+
+    // Get selected channel and program
+    final selectedChannel =
+        channels.isEmpty ? null : channels[selectedChannelIndex];
     EPGProgram? selectedProgram;
-    if (selectedChannel?.programIds.isNotEmpty ?? false) {
-      selectedProgram =
-          programsBox.get(selectedChannel!.programIds[selectedProgramIndex]);
+
+    if (selectedChannel != null && selectedChannel.programIds.isNotEmpty) {
+      // Get programs for the selected channel
+      final programs = selectedChannel.programIds
+          .map((id) => programsBox.get(id))
+          .where((program) => program != null)
+          .toList()
+          .cast<EPGProgram>();
+
+      // Filter programs to get the currently selected one based on visible grid
+      final visiblePrograms = _filterRelevantPrograms(
+          programs, timelineStart, timelineStart.add(const Duration(hours: 6)));
+
+      if (selectedProgramIndex < visiblePrograms.length) {
+        selectedProgram = visiblePrograms[selectedProgramIndex];
+        print("Selected program in header: ${selectedProgram.title}");
+        print(
+            "Time in header: ${selectedProgram.start} - ${selectedProgram.stop}");
+      }
     }
 
     return Column(
@@ -801,7 +1025,7 @@ class _PickerScreenState extends State<PickerScreen> {
                 Row(
                   children: [
                     Text(
-                      '${DateFormat('h:mm a').format(selectedProgram.start)} - ${DateFormat('h:mm a').format(selectedProgram.stop ?? selectedProgram.start.add(const Duration(minutes: 30)))}',
+                      '${DateFormat('h:mm a').format(selectedProgram.start.toLocal())} - ${DateFormat('h:mm a').format((selectedProgram.stop ?? selectedProgram.start.add(const Duration(minutes: 30))).toLocal())}',
                       style: TextStyle(
                         color: Colors.grey.shade400,
                         fontSize: 14,

@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:xtream_code_client/xtream_code_client.dart';
 import 'package:jtv/screens/PickerScreen.dart';
 
@@ -19,7 +19,6 @@ class _SignInScreenState extends State<SignInScreen> {
   final TextEditingController urlController = TextEditingController();
   final TextEditingController usernameController = TextEditingController();
   final TextEditingController passwordController = TextEditingController();
-  final FlutterSecureStorage secureStorage = FlutterSecureStorage();
 
   bool isLoading = false;
   String statusMessage = '';
@@ -48,9 +47,10 @@ class _SignInScreenState extends State<SignInScreen> {
     });
 
     try {
-      final savedUrl = await secureStorage.read(key: 'url');
-      final savedUsername = await secureStorage.read(key: 'username');
-      final savedPassword = await secureStorage.read(key: 'password');
+      final prefs = await SharedPreferences.getInstance();
+      final savedUrl = prefs.getString('url');
+      final savedUsername = prefs.getString('username');
+      final savedPassword = prefs.getString('password');
 
       if (savedUrl != null && savedUsername != null && savedPassword != null) {
         final urlInfo = _parseUrl(savedUrl);
@@ -112,11 +112,10 @@ class _SignInScreenState extends State<SignInScreen> {
 
       if (serverInfo.userInfo.auth != null &&
           serverInfo.userInfo.auth == true) {
-        await secureStorage.write(key: 'url', value: urlController.text);
-        await secureStorage.write(
-            key: 'username', value: usernameController.text);
-        await secureStorage.write(
-            key: 'password', value: passwordController.text);
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString('url', urlController.text);
+        await prefs.setString('username', usernameController.text);
+        await prefs.setString('password', passwordController.text);
 
         setState(() {
           statusMessage = 'Signed in successfully!';
